@@ -1,0 +1,6 @@
+OWM_KEY=""
+
+#TEelegram token
+TOKEN = ""
+# privileged chatid
+PRIVILEGED = 0
