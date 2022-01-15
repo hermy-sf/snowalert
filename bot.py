@@ -1,27 +1,35 @@
-from telegram import Update
+import datetime
+import pickle
+
+from telegram import Update, Chat
 from telegram.ext import Updater, CommandHandler, CallbackContext
 
 from logger import logger
-
-import datetime
 from forecast import Forecast
-
+from NoDb import NoDb
 from my_config import TOKEN, PRIVILEGED, checktimes
 
 
 #==================================================================#
 
+db = NoDb("contents.json", init={'cities': [], 'chats': {}, 'alerts': {}})
+
 cities = {}
 # chats = {
 #    chatid: {
 #       city1: [ job1, job2, ...]
-#       city2: [ ... ] 
+#       city2: [ ... ]
 #    }
 # }
-chats = {}
+chats = db.d['chats']
+
+def db_remove_alert(name):
+    if name in db.d['alerts']:
+        del db.d['alerts'][name]
+        db.flush()
 
 def get_jobnames(name, chat_id):
-    return [ "{}_hour{}_{}".format(name, h.hour, str(chat_id)) for h in checktimes ]
+    return [ "{}_hour{}_{}".format(name, h['hour'], chat_id) for h in checktimes ]
 
 
 def snow_alert(context):
@@ -30,7 +38,8 @@ def snow_alert(context):
     try:
         snow, det = cities[job.context[1]].check_snow_tomorrow()
         if snow:
-            context.bot.send_message(job.context[0], text='Snow Alert! {}'.format(det))
+        #if True:
+            context.bot.send_message(job.context[0], text='Snow Alert for {}! {}'.format([cities[job.context[1]].city], det))
     except RuntimeError:
         context.bot.send_message(job.context[0], text="Could not check weather for {}".format(job.context[1]))
 
@@ -43,15 +52,26 @@ def remove_job_if_exists(name, context):
         return False
     for job in current_jobs:
         job.schedule_removal()
+        db_remove_alert(name)
     return True
 
 
-def create_forecast(lat, lon):
+def create_forecast(lat, lon, sync=False):
     try:
         forecast = Forecast(lat, lon)
-        return True, forecast
     except RuntimeError:
-        return False, None
+        return False, None, None
+
+    exact_lat = forecast.lat
+    exact_lon = forecast.lon
+    name = "{}_{}".format(exact_lat, exact_lon)
+
+    if name not in cities:
+        cities[name] = forecast
+        if not sync:
+            db.d['cities'].append([exact_lat, exact_lon])
+            db.flush()
+    return True, name, forecast
 
 #===============================================================#
 
@@ -66,10 +86,10 @@ def start(update: Update, context: CallbackContext) -> None:
 
 
 def list_jobs(update: Update, context: CallbackContext) -> None:
-    chat_id = update.message.chat_id
+    chat_id = str(update.message.chat_id)
     res = []
     if chat_id == PRIVILEGED:
-        res = list(chats.items())
+        res = [ (Chat(int(key), 'private').username, value) for key,value in chats.items() ]
     else:
         if chat_id in chats:
             for j in chats[chat_id].keys():
@@ -82,7 +102,7 @@ def list_jobs(update: Update, context: CallbackContext) -> None:
 
 
 def weather(update: Update, context: CallbackContext) -> None:
-    chat_id = update.message.chat_id
+    chat_id = str(update.message.chat_id)
     text=""
     if chat_id in chats:
         for city in chats[chat_id]:
@@ -93,7 +113,7 @@ def weather(update: Update, context: CallbackContext) -> None:
 
 
 def snow(update: Update, context: CallbackContext) -> None:
-    chat_id = update.message.chat_id
+    chat_id = str(update.message.chat_id)
     text=""
     if chat_id in chats:
         for city in chats[chat_id]:
@@ -114,28 +134,23 @@ def snow(update: Update, context: CallbackContext) -> None:
 
 def set_snow_alert(update: Update, context: CallbackContext) -> None:
     """Add a job to the queue."""
-    chat_id = update.message.chat_id
+    chat_id = str(update.message.chat_id)
     try:
-    #if True:
         lat = float(context.args[0])
         lon = float(context.args[1])
-        success, forecast = create_forecast(lat, lon)
+        success, name, forecast = create_forecast(lat, lon)
         if not success:
             update.message.reply_text("Could not create forecast. Please try again later.")
             return
-
-        exact_lat = forecast.lat
-        exact_lon = forecast.lon
-        name = "{}_{}".format(exact_lat, exact_lon)
-        if name not in cities:
-            cities[name] = forecast
 
         for t, n in zip(checktimes, get_jobnames(name, chat_id)):
             if chat_id in chats and name in chats[chat_id] and n in chats[chat_id][name]:
                 update.message.reply_text('Alert already actve. Usage: `/alert <lat> <lon>`')
                 return
 
-            context.job_queue.run_daily(snow_alert, t, context=[chat_id, name], name=n)
+            context.job_queue.run_daily(snow_alert, datetime.time(**t), context=[chat_id, name], name=n)
+            db.d['alerts'][n] = dict(time=t, context=[chat_id, name], name=n)
+
             if chat_id not in chats:
                 chats[chat_id] = { name: [] }
             if name not in chats[chat_id]:
@@ -143,7 +158,8 @@ def set_snow_alert(update: Update, context: CallbackContext) -> None:
 
             chats[chat_id][name].append(n)
 
-        text="Set snow alerts for {}: {} {}".format(forecast.city, exact_lat, exact_lon)
+        db.flush()
+        text="Set snow alerts for {}: {} {}".format(forecast.city, forecast.lat, forecast.lon)
         update.message.reply_text(text)
 
     except (IndexError, ValueError):
@@ -154,7 +170,7 @@ def set_snow_alert(update: Update, context: CallbackContext) -> None:
 
 def unset(update: Update, context: CallbackContext) -> None:
     """Remove the job if the user changed their mind."""
-    chat_id = update.message.chat_id
+    chat_id = str(update.message.chat_id)
     text="Removed jobs: "
     try:
         exact_lat = str(context.args[0])
@@ -197,6 +213,20 @@ def main():
     dispatcher.add_handler(CommandHandler("weather", weather))
     dispatcher.add_handler(CommandHandler("snow", snow))
     dispatcher.add_handler(CommandHandler("list", list_jobs))
+
+    print("Recovering previous locations:")
+    for item in db.d['cities']:
+        lat = item[0]
+        lon = item[1]
+        success, name, forecast = create_forecast(lat, lon, sync=True)
+        if not success:
+            print(f"Failed to add {name}. Exiting")
+            return
+
+    print("Recovering previous alerts:")
+    for key, alert in db.d['alerts'].items():
+        dispatcher.job_queue.run_daily(snow_alert, datetime.time(**alert['time']), context=alert['context'], name=alert['name'])
+
 
     # Start the Bot
     updater.start_polling()
